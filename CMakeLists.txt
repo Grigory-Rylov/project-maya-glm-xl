@@ -1010,7 +1010,9 @@ if(STRATA_NATIVE_EXPERTS)
     if(MSVC)
       target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
     endif()
-    target_link_libraries(strata_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target})
+    # ggml-cuda's CU_CHECK calls the driver's cuGetErrorString (common.cuh); CUDA 13's cudart_static no longer
+    # pulls the driver library in transitively, so link it here.
+    target_link_libraries(strata_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target} CUDA::cuda_driver)
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
     # the GLM fast path's prompt path (src/core/glm_prefill.cu) multiplies its experts with MMQ too
