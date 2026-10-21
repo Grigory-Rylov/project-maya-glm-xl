@@ -4980,14 +4980,17 @@ static bool exl3_jobs(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t
     return nx == 0 || exl3::mv(xj, nx, s);
 }
 
-// A job without the activations its weight type reads - F32 / BF16 the floats (xf), the quantized types the q8_1
-// (xq), EXL3 either - is refused: its kernel would read from address 0 (issue #173: a BF16 DFlash2 drafter's GEMVs
-// carried no xf, and its first draft faulted the device for good)
+// A job without the activations its weight type reads - F32 the floats (xf), the quantized types the q8_1 (xq),
+// BF16 and EXL3 either (their kernels read xf when it is there, else the q8_1: a selective EXL3 pack's BF16 rows
+// serve the KDA output, whose gated q kda_rec hands over as q8_1) - is refused: its kernel would read from
+// address 0 (issue #173: a BF16 DFlash2 drafter's GEMVs carried no activations at all, and its first draft
+// faulted the device for good)
 static bool mv_inputs_ok(const MvJob* jobs, int n, const char* who) {
     for (int i = 0; i < n; ++i) {
         const MvJob& j = jobs[i];
-        const bool fl = j.type == kTypeF32 || j.type == kTypeBF16;
-        if (j.type == exl3::kTypeEXL3 ? j.xf != nullptr || j.xq != nullptr : fl ? j.xf != nullptr : j.xq != nullptr)
+        const bool fl = j.type == kTypeF32;
+        const bool either = j.type == exl3::kTypeEXL3 || j.type == kTypeBF16;
+        if (either ? j.xf != nullptr || j.xq != nullptr : fl ? j.xf != nullptr : j.xq != nullptr)
             continue;
         std::fprintf(stderr, "glm_fast %s: a type %d job without its %s activations\n", who, j.type,
                      fl ? "float" : "q8_1");
