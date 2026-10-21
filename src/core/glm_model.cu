@@ -37,6 +37,7 @@
 #include <cstddef>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <tuple>
@@ -58,6 +59,7 @@
 #endif
 #include <sys/stat.h>
 #include <cstdlib>
+#include <cerrno>
 #include <cstring>
 #include <numeric>
 
@@ -119,12 +121,22 @@ struct Exl3Table {
     };
     std::map<std::string, Mat> mats;
     struct Layer {
-        int cb = -1, k2[3] = {0, 0, 0}, k[3] = {0, 0, 0}, n[3] = {0, 0, 0};
-        std::vector<int> file;        // [9 e + 3 r + j]
+        int cb = -1, tp = 1, k2[3] = {0, 0, 0}, k[3] = {0, 0, 0}, n[3] = {0, 0, 0};
+        std::vector<int> file;        // [9 e + 3 r + j] the piece's first source
         std::vector<uint64_t> off;
-        uint64_t part(int r) const {
-            return (uint64_t) k[r] * n[r] * k2[r] / 16 + 2 * (uint64_t) k[r] + 2 * (uint64_t) n[r];
+        std::vector<int> src_file;    // every source of every piece, in order
+        std::vector<uint64_t> src_off;
+        std::vector<uint64_t> src_len;
+        std::vector<size_t> pstart;   // [9 e + 3 r + j + 1]: the piece's sources in src_*
+        // a part is [trellis | suh | svh]; tensor-parallel experts (tp ranks): gate / up hold their input split
+        // whole, so their suh is tp per-rank copies of the full [k] scale and their svh the ranks' [n / tp] slices
+        // concatenated; down is the transpose of that.  The trellis is the rank slices concatenated either way.
+        uint64_t piece(int r, int j) const {
+            if (j == 0) return (uint64_t) k[r] * n[r] * k2[r] / 16;
+            if (j == 1) return (r == 2 ? 1 : (size_t) tp) * 2 * (uint64_t) k[r];
+            return (r == 2 ? (size_t) tp : 1) * 2 * (uint64_t) n[r];
         }
+        uint64_t part(int r) const { return piece(r, 0) + piece(r, 1) + piece(r, 2); }
         uint64_t blob() const { return 2 * part(0) + part(2); }
     };
     std::map<int, Layer> layers;
@@ -203,6 +215,19 @@ static bool exl3_table(const std::string& pack_dir, Exl3Table& t, std::string& e
                 }
             L.k[1] = L.k[0];
             L.n[1] = L.n[0];
+            int tpr = 0;
+            ss >> tpr;
+            if (ss.fail()) {
+                L.tp = 1;
+                ss.clear();   // a v1 line without the tp field
+            } else if (tpr < 1 || tpr > 4 || L.n[0] % tpr != 0 || L.k[2] % tpr != 0 ||
+                       (L.n[0] / tpr) % 128 != 0) {   // the kernels: tp 1-4, each rank's slice whole 128-column tiles
+                err = "exl3.txt: layer " + std::to_string(il) + " has tp " + std::to_string(tpr) +
+                      "; the kernels cover tp 1-4 with each rank's slice a whole number of 128-column tiles";
+                return false;
+            } else {
+                L.tp = tpr;
+            }
             if (L.part(0) != gu || L.part(2) != dn) {
                 err = "exl3.txt: layer " + std::to_string(il) + "'s part sizes disagree with its shapes";
                 return false;
@@ -221,15 +246,66 @@ static bool exl3_table(const std::string& pack_dir, Exl3Table& t, std::string& e
                 err = "exl3.txt: expert line for an unknown layer / expert: " + line;
                 return false;
             }
-            for (int j = 0; j < 9; ++j) {
-                int fi = -1;
-                uint64_t off = 0;
-                if (!(ss >> fi >> off) || fi < 0 || fi >= (int) t.files.size()) {
+            // nine pieces follow: each is "<nsrc> <file> <off> <bytes> ..." - a tensor-parallel piece is its rank slices,
+            // concatenated in order; a legacy line is nine bare "<file> <off>" pairs
+            std::vector<int64_t> v;
+            std::string tok;
+            while (ss >> tok) {
+                char* end = nullptr;
+                const int64_t z = std::strtoll(tok.c_str(), &end, 10);
+                if (!end || *end) {
                     err = "exl3.txt: bad expert line: " + line;
                     return false;
                 }
-                it->second.file[(size_t) e * 9 + (size_t) j] = fi;
-                it->second.off[(size_t) e * 9 + (size_t) j] = off;
+                v.push_back(z);
+            }
+            Exl3Table::Layer& L = it->second;
+            const size_t i0 = (size_t) e * 9;
+            if (L.pstart.size() < (size_t) n_expert * 9 + 1) L.pstart.assign((size_t) n_expert * 9 + 1, 0);
+            L.pstart[i0] = (size_t) L.src_file.size();
+            auto fail = [&] { err = "exl3.txt: bad expert line: " + line; return false; };
+            if (v.size() == 18) {   // legacy: nine single-source pieces
+                for (int j = 0; j < 9; ++j) {
+                    const int fi = (int) v[2 * j];
+                    if (fi < 0 || fi >= (int) t.files.size()) return fail();
+                    const uint64_t off = (uint64_t) v[2 * j + 1];
+                    L.file[i0 + (size_t) j] = fi;
+                    L.off[i0 + (size_t) j] = off;
+                    L.src_file.push_back(fi);
+                    L.src_off.push_back(off);
+                    L.src_len.push_back(L.piece(j / 3, j % 3));
+                    L.pstart[i0 + (size_t) j + 1] = (size_t) L.src_file.size();
+                }
+            } else {
+                size_t p = 0;
+                for (int j = 0; j < 9; ++j) {
+                    if (p >= v.size()) return fail();
+                    const int nsrc = (int) v[p++];
+                    if (nsrc < 1 || p + (size_t) nsrc * 3 > v.size()) return fail();
+                    uint64_t sum = 0;
+                    int fi0 = -1;
+                    uint64_t off0 = 0;
+                    for (int q = 0; q < nsrc; ++q) {
+                        const int fi = (int) v[p++];
+                        const uint64_t off = (uint64_t) v[p++];
+                        const uint64_t len = (uint64_t) v[p++];
+                        if (fi < 0 || fi >= (int) t.files.size()) return fail();
+                        if (q == 0) { fi0 = fi; off0 = off; }
+                        L.src_file.push_back(fi);
+                        L.src_off.push_back(off);
+                        L.src_len.push_back(len);
+                        sum += len;
+                    }
+                    L.file[i0 + (size_t) j] = fi0;
+                    L.off[i0 + (size_t) j] = off0;
+                    if (sum != L.piece(j / 3, j % 3)) {
+                        err = "exl3.txt: layer " + std::to_string(il) + " expert " + std::to_string(e) +
+                              "'s piece " + std::to_string(j) + " sources sum to " + std::to_string(sum) +
+                              " bytes, its shape says " + std::to_string(L.piece(j / 3, j % 3));
+                        return false;
+                    }
+                    L.pstart[i0 + (size_t) j + 1] = (size_t) L.src_file.size();
+                }
             }
         }
     }
@@ -2759,7 +2835,7 @@ static bool pack_shard_mmap(const std::string& path, strata::core::Glm5Model::Sh
 #else
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {
-        err = "pack: open failed for " + path;
+        err = "pack: open failed for " + path + ": " + std::strerror(errno);
         return false;
     }
     struct stat st{};
@@ -2966,6 +3042,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                 nl.layer = il;
                 nl.fmt.gu_type = nl.fmt.d_type = x3::kTypeEXL3;
                 nl.x_cb = X.cb;
+                nl.x_tp = X.tp;
                 for (int r = 0; r < 3; ++r) {
                     nl.x_k2[r] = X.k2[r];
                     nl.x_k[r] = X.k[r];
@@ -2973,15 +3050,22 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                 }
                 nl.x_off = X.off;
                 nl.x_shard.resize(X.file.size());
-                for (size_t i = 0; i < X.file.size(); ++i) {
-                    nl.x_shard[i] = exl3_shard0_ + X.file[i];
-                    const int r = (int) (i % 9) / 3, j = (int) (i % 3);
-                    if (X.off[i] + nl.x_piece(r, j) > pack_shards_[(size_t) nl.x_shard[i]].size) {
-                        err = "pack: exl3.txt layer " + std::to_string(il) + " expert " + std::to_string(i / 9) +
-                              " lies past the end of " + xt.files[(size_t) X.file[i]];
-                        return false;
+                for (size_t i = 0; i < X.file.size(); ++i) nl.x_shard[i] = exl3_shard0_ + X.file[i];
+                nl.x_src_off = X.src_off;
+                nl.x_src_len = X.src_len;
+                nl.x_pstart = X.pstart;
+                nl.x_src_shard.resize(X.src_file.size());
+                for (size_t pi = 0; pi + 1 < X.pstart.size(); ++pi)
+                    for (size_t s = X.pstart[pi]; s < X.pstart[pi + 1]; ++s) {
+                        nl.x_src_shard[s] = exl3_shard0_ + X.src_file[s];
+                        const int e = (int) (pi / 9), r = (int) ((pi % 9) / 3), j = (int) (pi % 3);
+                        if (X.src_off[s] + X.src_len[s] > pack_shards_[(size_t) nl.x_src_shard[s]].size) {
+                            err = "pack: exl3.txt layer " + std::to_string(il) + " expert " + std::to_string(e) +
+                                  " piece " + std::to_string(r) + "." + std::to_string(j) +
+                                  " lies past the end of " + xt.files[(size_t) X.src_file[s]];
+                            return false;
+                        }
                     }
-                }
                 pack_layers_[(size_t) il] = std::move(nl);
             }
             std::fprintf(stderr, "glm pack: CUDA%d EXL3: %zu safetensors, %zu matrices, %zu expert layers\n", dev_,
@@ -3177,6 +3261,10 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             }
             { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, raw.data(), (size_t) r.bytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
             w16_[r.name] = (const uint16_t*) ((uint8_t*) w_arena_ + at);
+            // the same row as a BF16 WSlot: the head (and anything else served through ws_map_) reads it there -
+            // a selective EXL3 pack keeps output.weight BF16 (kind 4), and the mv kernel answers a BF16 row
+            ws_map_[r.name] = strata::core::WSlot{nullptr, strata::kernels::glmf::kTypeBF16,
+                                                  (const void*) ((uint8_t*) w_arena_ + at), t->shape[0], t->shape[1]};
             at += (r.bytes + 255u) & ~(uint64_t) 255u;
             continue;
         }
@@ -3785,6 +3873,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         }
         nl.fmt.gu_type = nl.fmt.d_type = strata::kernels::exl3::kTypeEXL3;
         nl.x_cb = X.cb;
+        nl.x_tp = X.tp;
         for (int r = 0; r < 3; ++r) {
             nl.x_k2[r] = X.k2[r];
             nl.x_k[r] = X.k[r];
@@ -3792,13 +3881,19 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         }
         nl.x_off = X.off;
         nl.x_shard.resize(X.file.size());
-        for (size_t i = 0; i < X.file.size(); ++i) {
-            nl.x_shard[i] = exl3_shard0_ + X.file[i];
-            if (X.off[i] + nl.x_piece((int) (i % 9) / 3, (int) (i % 3)) > pack_shards_[(size_t) nl.x_shard[i]].size) {
-                err = "mtp: an expert of the draft block lies past the end of its file";
-                return false;
+        for (size_t i = 0; i < X.file.size(); ++i) nl.x_shard[i] = exl3_shard0_ + X.file[i];
+        nl.x_src_off = X.src_off;
+        nl.x_src_len = X.src_len;
+        nl.x_pstart = X.pstart;
+        nl.x_src_shard.resize(X.src_file.size());
+        for (size_t pi = 0; pi + 1 < X.pstart.size(); ++pi)
+            for (size_t s = X.pstart[pi]; s < X.pstart[pi + 1]; ++s) {
+                nl.x_src_shard[s] = exl3_shard0_ + X.src_file[s];
+                if (X.src_off[s] + X.src_len[s] > pack_shards_[(size_t) nl.x_src_shard[s]].size) {
+                    err = "mtp: an expert of the draft block lies past the end of its file";
+                    return false;
+                }
             }
-        }
         if (pack_layers_.size() < (size_t) il + 1) pack_layers_.resize((size_t) il + 1);
         pack_layers_[(size_t) il] = std::move(nl);
         if (pack_emb_src_ == nullptr) {

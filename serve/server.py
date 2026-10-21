@@ -1249,6 +1249,20 @@ def gpu_list(cfg: dict) -> list[int]:
     return [int(str(x).strip()) for x in items if str(x).strip() != ""]
 
 
+def raise_fd_limit(n: int = 65536) -> None:
+    """Raise this process's soft file-descriptor limit toward its hard one: a multi-GPU load of a many-shard pack
+    (an EXL3 checkpoint keeps two handles per source file per GPU) runs past a login shell's default 1024, and the
+    engine then fails with "open failed" on files that exist."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = min(hard if hard > 0 else n, max(n, soft))
+        if soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+    except Exception:                               # Windows has no resource module; a refused raise keeps the old limit
+        pass
+
+
 def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32")."""
@@ -3806,6 +3820,7 @@ def watch_parent(stop, stdin=None, getppid=None, poll: float = 1.0) -> None:
 
 
 def main() -> int:
+    raise_fd_limit()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "

@@ -431,15 +431,23 @@ public:
         strata::kernels::cpu::NativeFmt fmt;
         int gate_shard = 0, up_shard = 0, down_shard = 0;
         uint64_t gate_off = 0, up_off = 0, down_off = 0;   // absolute file offsets of the tensors
-        // EXL3 experts (exl3.txt, x_cb >= 0): expert e's part r (gate, up, down) piece j (trellis, suh, svh) lies at
-        // x_off[9 e + 3 r + j] of shard x_shard[...]; the blob is [gate | up | down], a part [trellis | suh | svh]
+        // EXL3 experts (exl3.txt, x_cb >= 0): expert e's part r (gate, up, down) piece j (trellis, suh, svh) is the
+        // sources x_src_*[x_pstart[9 e + 3 r + j] .. x_pstart[+1]) in order (a tensor-parallel piece is its rank slices);
+        // x_shard/x_off[9 e + 3 r + j] is the piece's first source, the disk-order sort key; the blob is [gate | up | down],
+        // a part [trellis | suh | svh]
         int x_cb = -1;
+        int x_tp = 1;                 // the tensor-parallel rank count of the quantized experts
         int x_k2[3] = {0, 0, 0}, x_k[3] = {0, 0, 0}, x_n[3] = {0, 0, 0};   // x_k2: each part's bitrate as 2 K
         std::vector<int> x_shard;
         std::vector<uint64_t> x_off;
+        std::vector<int> x_src_shard;     // every source of every piece, in order
+        std::vector<uint64_t> x_src_off;
+        std::vector<uint64_t> x_src_len;  // the source's bytes in its shard
+        std::vector<size_t> x_pstart;     // [9 e + 3 r + j + 1]: the piece's sources in x_src_*
         size_t x_piece(int r, int j) const {
-            return j == 0 ? (size_t) x_k[r] * (size_t) x_n[r] * (size_t) x_k2[r] / 16
-                          : 2 * (size_t) (j == 1 ? x_k[r] : x_n[r]);
+            if (j == 0) return (size_t) x_k[r] * (size_t) x_n[r] * (size_t) x_k2[r] / 16;
+            if (j == 1) return (r == 2 ? 1 : (size_t) x_tp) * 2 * (size_t) x_k[r];
+            return (r == 2 ? (size_t) x_tp : 1) * 2 * (size_t) x_n[r];
         }
         size_t x_part(int r) const { return x_piece(r, 0) + x_piece(r, 1) + x_piece(r, 2); }
     };

@@ -207,11 +207,13 @@ void Glm5Model::mtp_draft_setup() {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const WSlot& ow = ws_map_.at("output.weight");
-    const size_t hb = ow.type == 0 ? (size_t) g.n_embd * sizeof(float) : ggml_row_size((ggml_type) ow.type, g.n_embd);
+    // the row bytes of the head's storage: F32, BF16 (a selective EXL3 pack) or a ggml quant; an EXL3 head has
+    // no fixed row size, and the gathered-rows path then stays off (the cleanup below clears the vocab scan)
+    const size_t hb = strata::kernels::glmf::row_bytes(ow.type, g.n_embd);
     const void* head = ow.type == 0 ? (const void*) ow.f32 : ow.q;
     if (mtp_vlead_ > 0 && head != nullptr) {
         const int dx = (int) mtp_vextra_.size();
-        bool ok = true;
+        bool ok = hb != 0;
         if (dx > 0) {
             ok = cudaMalloc(&F->mtp_dx_w, (size_t) dx * hb) == cudaSuccess &&
                  cudaMalloc((void**) &F->mtp_dx_ids, (size_t) dx * sizeof(int)) == cudaSuccess;

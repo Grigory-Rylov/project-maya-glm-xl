@@ -608,6 +608,29 @@ __device__ __forceinline__ float row_dot_bf16(const uint16_t* row, const float* 
     return warp_sum(s);
 }
 
+// BF16 weights against a q8_1 activation: the selective EXL3 pack (tools/exl3_pack.py, the Maya-XL checkpoint)
+// keeps the attention / dense-FFN / shared-expert projections in source precision while the decode keeps its
+// activations q8_1.  Four sub-chunks of 8 per 32-block; the cols and nt variants keep row_dot's per-activation
+// order bit for bit, as every pair here does.
+__device__ __forceinline__ float row_dot_bf16_q8(const uint16_t* row, const block_q8_1* x, int n_in, int lane) {
+    float s = 0.0f;
+    for (int k = lane; k < (n_in / 32) * 4; k += 32) {
+        const block_q8_1* xb = x + (k >> 2);
+        const float d = __low2float(xb->ds);   // the activation is symmetric: x = d * q (q8_1_store_warp)
+        const uint4 w = ((const uint4*) (row + (size_t) (k >> 2) * 32))[k & 3];
+        const int qa = ((const int*) xb->qs)[2 * (k & 3)], qb = ((const int*) xb->qs)[2 * (k & 3) + 1];
+        const int8_t* a = (const int8_t*) &qa;
+        const int8_t* bq = (const int8_t*) &qb;
+        const float w0 = __uint_as_float(w.x << 16), w1 = __uint_as_float(w.x & 0xffff0000u),
+                    w2 = __uint_as_float(w.y << 16), w3 = __uint_as_float(w.y & 0xffff0000u),
+                    w4 = __uint_as_float(w.z << 16), w5 = __uint_as_float(w.z & 0xffff0000u),
+                    w6 = __uint_as_float(w.w << 16), w7 = __uint_as_float(w.w & 0xffff0000u);
+        s += d * (w0 * a[0] + w1 * a[1] + w2 * a[2] + w3 * a[3] + w4 * bq[0] + w5 * bq[1] + w6 * bq[2] +
+                  w7 * bq[3]);
+    }
+    return warp_sum(s);
+}
+
 template<int T>
 __device__ __forceinline__ size_t rbytes(int n_in) { return (size_t) (n_in / F<T>::qk) * F<T>::bytes; }
 
@@ -1260,7 +1283,10 @@ __device__ __forceinline__ float any_row_dot(int type, const void* w, int row, c
                                              int n_in, int lane) {
     switch (type) {
         case kTypeF32: return row_dot_f32((const float*) w + (size_t) row * n_in, xf, n_in, lane);
-        case kTypeBF16: return row_dot_bf16((const uint16_t*) w + (size_t) row * n_in, xf, n_in, lane);
+        case kTypeBF16:
+            return xf != nullptr ? row_dot_bf16((const uint16_t*) w + (size_t) row * n_in, xf, n_in, lane)
+                                 : row_dot_bf16_q8((const uint16_t*) w + (size_t) row * n_in,
+                                                   (const block_q8_1*) xq, n_in, lane);
 #define GF_CASE(T) case T: return row_dot<T>((const uint8_t*) w + (size_t) row * rbytes<T>(n_in), (const block_q8_1*) xq, n_in, lane);
         GF_CASE(12) GF_CASE(13) GF_CASE(14) GF_CASE(8) GF_CASE(16) GF_CASE(18) GF_CASE(19) GF_CASE(23) GF_CASE(10) GF_CASE(11)
         GF_CASE(17) GF_CASE(22) GF_CASE(21) GF_CASE(29)
@@ -1307,6 +1333,35 @@ __device__ __forceinline__ void row_dot_bf16_cols(const uint16_t* row, const flo
                 const float4* x4 = (const float4*) (x + c * xs);
                 const float4 a = x4[2 * k], b = x4[2 * k + 1];
                 s[c] += w0 * a.x + w1 * a.y + w2 * a.z + w3 * a.w + w4 * b.x + w5 * b.y + w6 * b.z + w7 * b.w;
+            }
+    }
+#pragma unroll
+    for (int c = 0; c < kMaxMvCols; ++c)
+        if (c < ncol) s[c] = warp_sum(s[c]);
+}
+
+// row_dot_bf16_q8's cols / nt siblings: the weight row read once for all the columns, each column's sum the
+// one-activation kernel's bit for bit
+__device__ __forceinline__ void row_dot_bf16_q8_cols(const uint16_t* row, const uint8_t* x, int64_t xs, int ncol,
+                                                     int n_in, int lane, float* s) {
+#pragma unroll
+    for (int c = 0; c < kMaxMvCols; ++c) s[c] = 0.0f;
+    for (int k = lane; k < (n_in / 32) * 4; k += 32) {
+        const uint4 w = ((const uint4*) (row + (size_t) (k >> 2) * 32))[k & 3];
+        const float w0 = __uint_as_float(w.x << 16), w1 = __uint_as_float(w.x & 0xffff0000u),
+                    w2 = __uint_as_float(w.y << 16), w3 = __uint_as_float(w.y & 0xffff0000u),
+                    w4 = __uint_as_float(w.z << 16), w5 = __uint_as_float(w.z & 0xffff0000u),
+                    w6 = __uint_as_float(w.w << 16), w7 = __uint_as_float(w.w & 0xffff0000u);
+#pragma unroll
+        for (int c = 0; c < kMaxMvCols; ++c)
+            if (c < ncol) {
+                const block_q8_1* xb = (const block_q8_1*) (x + c * xs) + (k >> 2);
+                const float d = __low2float(xb->ds);
+                const int qa = ((const int*) xb->qs)[2 * (k & 3)], qb = ((const int*) xb->qs)[2 * (k & 3) + 1];
+                const int8_t* a = (const int8_t*) &qa;
+                const int8_t* bq = (const int8_t*) &qb;
+                s[c] += d * (w0 * a[0] + w1 * a[1] + w2 * a[2] + w3 * a[3] + w4 * bq[0] + w5 * bq[1] + w6 * bq[2] +
+                             w7 * bq[3]);
             }
     }
 #pragma unroll
@@ -1372,7 +1427,12 @@ __global__ void __launch_bounds__(256) mv_kernel_cols(const STRATA_GRID_CONSTANT
     if (row >= J.n_out) return;
     if (J.type == kTypeBF16) {
         float s[kMaxMvCols];
-        row_dot_bf16_cols((const uint16_t*) J.w + (size_t) row * J.n_in, J.xf, J.xf_cstride, J.ncol, J.n_in, lane, s);
+        if (J.xf != nullptr)
+            row_dot_bf16_cols((const uint16_t*) J.w + (size_t) row * J.n_in, J.xf, J.xf_cstride, J.ncol, J.n_in, lane,
+                              s);
+        else
+            row_dot_bf16_q8_cols((const uint16_t*) J.w + (size_t) row * J.n_in, (const uint8_t*) J.xq, J.xq_cstride,
+                                 J.ncol, J.n_in, lane, s);
         if (lane == 0)
 #pragma unroll
             for (int c = 0; c < kMaxMvCols; ++c)
@@ -1484,11 +1544,43 @@ __device__ __forceinline__ void row_dot_bf16_nt(const uint16_t* row, const float
     for (int t = 0; t < NT; ++t) s[t] = warp_sum(acc[t]);
 }
 template<int NT>
+__device__ __forceinline__ void row_dot_bf16_q8_nt(const uint16_t* row, const block_q8_1* x, size_t xs, int n_in,
+                                                   int lane, float (&s)[NT]) {
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0.0f;
+    for (int k = lane; k < (n_in / 32) * 4; k += 32) {
+        const uint4 w = ((const uint4*) (row + (size_t) (k >> 2) * 32))[k & 3];
+        const float w0 = __uint_as_float(w.x << 16), w1 = __uint_as_float(w.x & 0xffff0000u),
+                    w2 = __uint_as_float(w.y << 16), w3 = __uint_as_float(w.y & 0xffff0000u),
+                    w4 = __uint_as_float(w.z << 16), w5 = __uint_as_float(w.z & 0xffff0000u),
+                    w6 = __uint_as_float(w.w << 16), w7 = __uint_as_float(w.w & 0xffff0000u);
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            const block_q8_1* xb = x + (size_t) t * xs + (k >> 2);
+            const float d = __low2float(xb->ds);
+            const int qa = ((const int*) xb->qs)[2 * (k & 3)], qb = ((const int*) xb->qs)[2 * (k & 3) + 1];
+            const int8_t* a = (const int8_t*) &qa;
+            const int8_t* bq = (const int8_t*) &qb;
+            acc[t] += d * (w0 * a[0] + w1 * a[1] + w2 * a[2] + w3 * a[3] + w4 * bq[0] + w5 * bq[1] + w6 * bq[2] +
+                           w7 * bq[3]);
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) s[t] = warp_sum(acc[t]);
+}
+template<int NT>
 __device__ __forceinline__ void any_row_dot_nt(int type, const void* w, int row, const void* xq, const float* xf,
                                                int n_in, int lane, float (&s)[NT]) {
     switch (type) {
         case kTypeF32: row_dot_f32_nt<NT>((const float*) w + (size_t) row * n_in, xf, n_in, lane, s); return;
-        case kTypeBF16: row_dot_bf16_nt<NT>((const uint16_t*) w + (size_t) row * n_in, xf, n_in, lane, s); return;
+        case kTypeBF16:
+            if (xf != nullptr)
+                row_dot_bf16_nt<NT>((const uint16_t*) w + (size_t) row * n_in, xf, n_in, lane, s);
+            else
+                row_dot_bf16_q8_nt<NT>((const uint16_t*) w + (size_t) row * n_in, (const block_q8_1*) xq,
+                                       (size_t) (n_in / 32), n_in, lane, s);
+            return;
 #define GF_CASE_NT(T)                                                                                               \
     case T:                                                                                                         \
         row_dot_nt<T, NT>((const uint8_t*) w + (size_t) row * rbytes<T>(n_in), (const block_q8_1*) xq,             \

@@ -14,10 +14,11 @@ packer leaves those where they are and writes:
   pack/index.txt           as for a GGUF model; the EXL3 matrices are rows of kind x
   pack/dense.bin           the float rows (BF16 where the engine reads BF16, else F32)
   pack/exl3.txt            the EXL3 matrices (file, trellis / suh / svh offsets, k, n, bits, codebook) and every
-                           routed expert's three parts (gate, up, down: [suh | svh | codebook word | trellis] each),
-                           read in place by the engine; the bits a weight are K ("3"), or "3.5" for exllamav3 1.6's
-                           half-integer K (1.5 / 2.5 / 3.5: 24 / 40 / 56 words a tile, mul1 only), which an engine
-                           from before half-integer K refuses instead of misreading
+                           routed expert's nine pieces (trellis / suh / svh of gate, up and down), each listed as
+                           its sources - a tensor-parallel checkpoint's piece is its rank slices - read in place
+                           by the engine; the bits a weight are K ("3"), or "3.5" for exllamav3 1.6's half-integer
+                           K (1.5 / 2.5 / 3.5: 24 / 40 / 56 words a tile, mul1 only), which an engine from before
+                           half-integer K refuses instead of misreading
   pack/native_experts.txt  the header naming maya-exl3.gguf (no rows: the experts are in exl3.txt)
   pack/tokenizer/          from the model's tokenizer.json, typed as llama.cpp's converter types it, with Maya's
                            GLM-5.3 chat template (tools/glm_chat_template.jinja: the one Maya's own GGUFs carry - images,
@@ -27,6 +28,11 @@ packer leaves those where they are and writes:
 The fused KDA q|k|v projection stays one EXL3 matrix (attn_qkv): the engine serves q, k and v as column views of it.
 The NextN (MTP) block is packed too when the files carry it (block_count counts it, its floats go into the GGUF and
 its matrices and experts into exl3.txt); --no-mtp leaves it out.
+
+A selective checkpoint (quant_method exl3_selective_tp4) trellis-codes only the routed experts, sharded over the
+tensor-parallel ranks as rankN.trellis / .suh / .svh, and keeps every other tensor in source precision: the packer
+serves those as BF16 rows.  Its NextN block cannot be packed (the engine's draft block reads EXL3 experts), so a
+DFlash drafter drafts it.
 
 --check <gguf>: the converted float tensors against the same model's GGUF (exact where both keep them unquantized,
 BF16 rounding where the GGUF has F32), and the EXL3-decoded weights against its quantized ones (cosine - two quants
@@ -92,6 +98,9 @@ class SafeTensors:
 
     def raw(self, name: str) -> np.ndarray:
         fn, _, _, off, nb = self.t[name]
+        return self.mm[fn][off:off + nb]
+
+    def raw_at(self, fn: str, off: int, nb: int) -> np.ndarray:
         return self.mm[fn][off:off + nb]
 
     def f32(self, name: str) -> np.ndarray:
@@ -197,8 +206,8 @@ def exl3_rows(trellis: np.ndarray, suh: np.ndarray, svh: np.ndarray, k2: int, cb
 
 # ------------------------------------------------------------------ the plan
 class Plan:
-    def __init__(self, st: SafeTensors, cfg: dict):
-        self.st, self.cfg = st, cfg
+    def __init__(self, st: SafeTensors, cfg: dict, tp: int = 1):
+        self.st, self.cfg, self.tp = st, cfg, tp
         self.floats: list[tuple] = []     # (gguf name, gguf shape, "F32" | "BF16" | "BF16RAW", producer)
         self.mats: list[tuple] = []       # (gguf name, hf prefix, k, n, k2 = 2 K, cb)
         self.layers: list[dict] = []      # per MoE layer: the expert parts
@@ -210,6 +219,9 @@ class Plan:
     def bf16(self, gname, shape, fn):
         self.floats.append((gname, shape, "BF16", fn))
 
+    def bf16raw(self, gname, shape, fn):
+        self.floats.append((gname, shape, "BF16RAW", fn))
+
     def gguf_only(self, n0: int):
         """The floats added since index n0 go into maya-exl3.gguf but not into index.txt / dense.bin."""
         self.floats[n0:] = [(n, sh, ty + ":gguf", fn) for n, sh, ty, fn in self.floats[n0:]]
@@ -218,7 +230,14 @@ class Plan:
         st = self.st
         if not st.has(hf + ".trellis"):
             if st.has(hf + ".weight"):
-                raise SystemExit("%s is stored unquantized; the packer expects it as EXL3" % hf)
+                # a selective EXL3 checkpoint keeps everything but the routed experts in source precision: the engine
+                # serves it as a BF16 row
+                dt = st.t[hf + ".weight"][1]
+                if dt != "BF16":
+                    raise SystemExit("%s is stored unquantized as %s; the packer serves BF16 rows" % (hf, dt))
+                self.bf16raw(gname, None,
+                             lambda hf=hf: st.raw(hf + ".weight").view("<u2").reshape(st.t[hf + ".weight"][2]))
+                return
             raise SystemExit("%s: no tensor %s.trellis" % (gname, hf))
         if not st.has(hf + ".suh") or not st.has(hf + ".svh"):
             raise SystemExit("%s: EXL3 without suh/svh (an old packed-sign checkpoint); not supported" % hf)
@@ -253,7 +272,13 @@ class Plan:
                 self.f32(P + "hc_%s_base.weight" % s, None, g(H + "hc_%s_base" % s))
                 self.f32(P + "hc_%s_scale.weight" % s, None, g(H + "hc_%s_scale" % s))
             if il < n_layers and t["layer_types"][il] == "linear_attention":
-                self.mat(P + "attn_qkv.weight", A + "qkv_proj")
+                if not st.has(A + "qkv_proj.trellis") and st.has(A + "q_proj.weight"):
+                    # a selective checkpoint keeps the KDA q, k, v separate; the engine reads them as its own rows
+                    # (as in a GGUF pack), so there is no fused attn_qkv to split
+                    for nm, hf in (("attn_q", "q_proj"), ("attn_k", "k_proj"), ("attn_v", "v_proj")):
+                        self.mat(P + nm + ".weight", A + hf)
+                else:
+                    self.mat(P + "attn_qkv.weight", A + "qkv_proj")
                 self.mat(P + "attn_output.weight", A + "o_proj")
                 self.f32(P + "ssm_a", None, lambda A=A: -np.exp(st.f32(A + "A_log").reshape(-1)[:n_head]))
                 self.f32(P + "ssm_dt.bias", None, g(A + "dt_bias"))
@@ -315,37 +340,62 @@ class Plan:
     def _experts(self, il: int, M: str, n_expert: int) -> dict:
         """Every expert's nine pieces (trellis, suh, svh of gate, up and down) wherever the files keep them; the
         engine assembles its blob as [gate | up | down], each part [trellis | suh | svh] (every piece a multiple of
-        256 bytes).  Every expert of the layer must share the parts' shapes, bits and codebook."""
-        st = self.st
+        256 bytes).  A tensor-parallel checkpoint (tp ranks, rankN.trellis / .suh / .svh) keeps each piece as its
+        tp rank slices: gate / up hold the input split whole (their suh the tp per-rank copies of the full [k]
+        scale, their svh the ranks' [n / tp] slices concatenated), down the transpose; the trellis is the rank
+        slices concatenated either way.  Every expert of the layer must share the parts' shapes, bits and codebook."""
+        st, tp = self.st, self.tp
         lay = None
         rows = []
         for e in range(n_expert):
-            parts, shape = [], []
+            pieces, shape = [], []
             for r in ROLES:
                 p = M + "experts.%d.%s_proj." % (e, r)
-                for x in ("trellis", "suh", "svh"):
-                    if not st.has(p + x):
-                        raise SystemExit("layer %d expert %d: no %s%s" % (il, e, p, x))
-                kt, nt, w = st.t[p + "trellis"][2]
-                if st.t[p + "suh"][1] != "F16" or st.t[p + "svh"][1] != "F16":
+                nm = lambda q, x: p + ("rank%d.%s" % (q, x) if tp > 1 else x)  # noqa: E731
+                for q in range(tp):
+                    for x in ("trellis", "suh", "svh"):
+                        if not st.has(nm(q, x)):
+                            raise SystemExit("layer %d expert %d: no %s" % (il, e, nm(q, x)))
+                kt, nt, w = st.t[nm(0, "trellis")][2]
+                if any(st.t[nm(q, x)][1] != "F16" for q in range(tp) for x in ("suh", "svh")):
                     raise SystemExit("layer %d expert %d %s: suh / svh are not F16" % (il, e, r))
-                cb = 2 if st.has(p + "mul1") else 1 if st.has(p + "mcg") else 0
+                cbs = {2 if st.has(nm(q, "mul1")) else 1 if st.has(nm(q, "mcg")) else 0 for q in range(tp)}
+                if len(cbs) != 1:
+                    raise SystemExit("layer %d expert %d %s: the ranks' codebooks differ" % (il, e, r))
+                if len({tuple(st.t[nm(q, "trellis")][2]) for q in range(tp)}) != 1:
+                    raise SystemExit("layer %d expert %d %s: the ranks' trellis shapes differ" % (il, e, r))
+                cb = cbs.pop()
                 shape.append((kt * 16, nt * 16, tile_k2(w, cb, "layer %d expert %d %s" % (il, e, r)), cb))
-                parts.append((self.st.files.index(st.t[p + "trellis"][0]), st.t[p + "trellis"][3],
-                              self.st.files.index(st.t[p + "suh"][0]), st.t[p + "suh"][3],
-                              self.st.files.index(st.t[p + "svh"][0]), st.t[p + "svh"][3]))
+                for x in ("trellis", "suh", "svh"):
+                    pieces.append([(st.files.index(st.t[nm(q, x)][0]), st.t[nm(q, x)][3], st.t[nm(q, x)][4])
+                                   for q in range(tp)])
             shape = tuple(shape)
             if lay is None:
                 lay = shape
             elif shape != lay:
                 raise SystemExit("layer %d expert %d: shapes / bits differ from expert 0's" % (il, e))
-            rows.append((e, parts))
+            rows.append((e, pieces))
         (gk, gn, gK2, gcb), (uk, un, uK2, ucb), (dk, dn, dK2, dcb) = lay
         if (gk, gn) != (uk, un) or gK2 != uK2 or not (gcb == ucb == dcb):
             raise SystemExit("layer %d: gate and up differ, or the codebooks do" % il)
-        part = lambda k, n, k2: k * n * k2 // 16 + 2 * k + 2 * n  # noqa: E731  (16 k2 bytes a 16x16 tile)
-        return {"layer": il, "cb": gcb, "k2": (gK2, uK2, dK2), "shape": (gk, gn, dk, dn),
-                "gu_bytes": part(gk, gn, gK2), "dn_bytes": part(dk, dn, dK2), "rows": rows}
+        gn, un, dk = gn * tp, un * tp, dk * tp   # the ranks split gate / up over the outputs, down over the inputs
+        dims = ((gk, gn, gK2), (uk, un, uK2), (dk, dn, dK2))
+
+        def piece(r, j):   # the engine's Exl3Table::Layer::piece
+            k, n, k2 = dims[r]
+            if j == 0:
+                return k * n * k2 // 16
+            return (1 if r == 2 else tp) * 2 * k if j == 1 else (tp if r == 2 else 1) * 2 * n
+
+        for e, pcs in rows:
+            for j in range(9):
+                got = sum(s[2] for s in pcs[j])
+                if got != piece(j // 3, j % 3):
+                    raise SystemExit("layer %d expert %d piece %d: its sources are %d bytes, its shapes say %d"
+                                     % (il, e, j, got, piece(j // 3, j % 3)))
+        return {"layer": il, "cb": gcb, "tp": tp, "k2": (gK2, uK2, dK2), "shape": (gk, gn, dk, dn),
+                "gu_bytes": piece(0, 0) + piece(0, 1) + piece(0, 2),
+                "dn_bytes": piece(2, 0) + piece(2, 1) + piece(2, 2), "rows": rows}
 
 
 # ------------------------------------------------------------------ the tokenizer, as llama.cpp's converter types it
@@ -519,17 +569,24 @@ def write_all(plan: Plan, d: pathlib.Path, out: pathlib.Path, t: dict, nextn: in
             continue
         gguf_only = ty.endswith(":gguf")
         ty = ty.split(":")[0]
-        a = np.ascontiguousarray(fn(), dtype=np.float32)
-        gs = gguf_shape(a.shape, shape)
-        if ty == "BF16":
-            b, lost = to_bf16(a)
-            lost_total += lost
-            data = b.tobytes()
+        if ty == "BF16RAW":
+            # a selective checkpoint's BF16 rows: the bits are already what the engine serves - copy them straight
+            a = np.ascontiguousarray(fn(), dtype=np.uint16)
+            gs = gguf_shape(a.shape, shape)
+            data = a.tobytes()
             kind = "4"
         else:
-            data = a.tobytes()
-            kind = "2"
-        tensors.append((name, gs, ty, data))
+            a = np.ascontiguousarray(fn(), dtype=np.float32)
+            gs = gguf_shape(a.shape, shape)
+            if ty == "BF16":
+                b, lost = to_bf16(a)
+                lost_total += lost
+                data = b.tobytes()
+                kind = "4"
+            else:
+                data = a.tobytes()
+                kind = "2"
+        tensors.append((name, gs, "BF16" if ty == "BF16RAW" else ty, data))
         if gguf_only:
             continue
         ne0 = gs[0] * gs[1] if len(gs) >= 3 else gs[0]
@@ -594,13 +651,14 @@ def write_all(plan: Plan, d: pathlib.Path, out: pathlib.Path, t: dict, nextn: in
 
     # ---- exl3.txt
     with replace_atomic(out / "exl3.txt") as fb, io.TextIOWrapper(fb, encoding="utf-8", newline="\n") as f:
-        f.write("# maya exl3 pack v1 -- generated by tools/exl3_pack.py from %s\n" % d.name)
+        f.write("# maya exl3 pack v2 -- generated by tools/exl3_pack.py from %s\n" % d.name)
         f.write("# file <i> <name>  |  mat <name> <file> <trellis_off> <suh_off> <svh_off> <k> <n> <K> <cb>  |\n")
         if any(m[4] % 2 for m in plan.mats) or any(x % 2 for L in plan.layers for x in L["k2"]):
             f.write("# K: bits a weight; 3.5 = exllamav3 1.6's half-integer K (an engine without it refuses the line)\n")
         f.write("# layer <l> <cb> <K_gate> <K_up> <K_down> <k_gate> <n_gate> <k_down> <n_down> <gu_bytes> <dn_bytes>"
-                "  |  e <l> <expert> then per part (gate, up, down): <file> <trellis_off> <file> <suh_off> <file> "
-                "<svh_off>  (absolute; the blob is [gate | up | down], a part [trellis | suh | svh])\n")
+                " <tp>  |  e <l> <expert> then per piece (gate, up, down x trellis, suh, svh): <nsrc> then that many"
+                " <file> <off> <bytes> (a tensor-parallel piece is its rank slices in order; absolute; the blob is"
+                " [gate | up | down], a part [trellis | suh | svh])\n")
         for i, fn in enumerate(st.files):
             f.write("file %d %s\n" % (i, fn))
         for name, hf, k, n, k2, cb in plan.mats:
@@ -608,10 +666,12 @@ def write_all(plan: Plan, d: pathlib.Path, out: pathlib.Path, t: dict, nextn: in
             f.write("mat %s %d %d %d %d %d %d %s %d\n" % (name, st.files.index(tf[0]), tf[3], st.t[hf + ".suh"][3],
                                                           st.t[hf + ".svh"][3], k, n, k_text(k2), cb))
         for L in plan.layers:
-            f.write("layer %d %d %s %s %s %d %d %d %d %d %d\n" % (
-                L["layer"], L["cb"], *(k_text(x) for x in L["k2"]), *L["shape"], L["gu_bytes"], L["dn_bytes"]))
-            for e, parts in L["rows"]:
-                f.write("e %d %d %s\n" % (L["layer"], e, " ".join("%d %d %d %d %d %d" % p for p in parts)))
+            f.write("layer %d %d %s %s %s %d %d %d %d %d %d %d\n" % (
+                L["layer"], L["cb"], *(k_text(x) for x in L["k2"]), *L["shape"], L["gu_bytes"], L["dn_bytes"],
+                L.get("tp", 1)))
+            for e, pieces in L["rows"]:
+                f.write("e %d %d %s\n" % (L["layer"], e, " ".join(
+                    "%d %s" % (len(pc), " ".join("%d %d %d" % s for s in pc)) for pc in pieces)))
     n_exp = sum(len(L["rows"]) for L in plan.layers)
     print("pack: %d float rows (dense.bin %.2f GB), %d EXL3 matrices, %d MoE layers x %d experts"
           % (sum(1 for r in rows if r[2] in "24"), at / 1e9, len(plan.mats), len(plan.layers),
@@ -650,9 +710,12 @@ def check(plan: Plan, d: pathlib.Path, ref: pathlib.Path, n_cols: int) -> int:
         if fn is None or name not in R:
             continue
         ty = ty.split(":")[0]
-        a = np.ascontiguousarray(fn(), dtype=np.float32).reshape(-1)
-        if ty == "BF16":
-            a = (to_bf16(a)[0].astype(np.uint32) << 16).view(np.float32)
+        if ty == "BF16RAW":
+            a = (np.ascontiguousarray(fn(), dtype=np.uint16).astype(np.uint32) << 16).view(np.float32).reshape(-1)
+        else:
+            a = np.ascontiguousarray(fn(), dtype=np.float32).reshape(-1)
+            if ty == "BF16":
+                a = (to_bf16(a)[0].astype(np.uint32) << 16).view(np.float32)
         b = ref_rows(name).reshape(-1)
         if a.size != b.size:
             print("  %-40s size %d vs %d  FAIL" % (name, a.size, b.size))
@@ -732,18 +795,23 @@ def main() -> int:
               % (d.name, cfg.get("architectures")))
         return 1
     q = cfg.get("quantization_config", {})
-    if q.get("quant_method") != "exl3":
-        print("%s is not an EXL3 model (quantization_config.quant_method %r)" % (d.name, q.get("quant_method")))
+    method = q.get("quant_method")
+    if method not in ("exl3", "exl3_selective_tp4"):
+        print("%s is not an EXL3 model (quantization_config.quant_method %r)" % (d.name, method))
         return 1
+    tp = int(q.get("tensor_parallel_size", 1) or 1)
     t = cfg["text_config"]
-    print("%s: EXL3 %s, %s bpw (head %s), codebook %s" % (d.name, q.get("version"), q.get("bits"), q.get("head_bits"),
-                                                          q.get("codebook", "3inst")))
+    print("%s: EXL3 %s, %s bpw (head %s), codebook %s%s" % (d.name, q.get("version") or method,
+                                                            q.get("bits") or q.get("bits_per_weight"),
+                                                            q.get("head_bits"), q.get("codebook", "3inst"),
+                                                            "" if tp == 1 else ", %d tensor-parallel ranks" % tp))
     st = SafeTensors(d)
-    plan = Plan(st, t)
+    plan = Plan(st, t, tp)
     nextn = int(t.get("num_nextn_predict_layers", 0) or 0)
     mtp = nextn > 0 and not a.no_mtp and st.has("model.language_model.layers.%d.eh_proj.trellis" % t["num_hidden_layers"])
     if nextn > 0 and not mtp and not a.no_mtp:
-        print("note: the config names a NextN block but the files do not carry it - packed without MTP")
+        print("note: the config names a NextN block but the files do not carry it as EXL3 - packed without MTP "
+              "(a DFlash drafter drafts it)")
     plan.build(mtp=mtp)
     if a.check:
         rc = check(plan, d, pathlib.Path(a.check).expanduser().absolute(), a.check_rows)

@@ -86,6 +86,7 @@ results. See [the prompt format notes](docs/deepseek-prompt-format.md) for API d
 | --- | ---: | --- | --- |
 | [EXL3 3.05 bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/3.05bpw) by turboderp | 125.3 GB | in the setup: `--model EXL3-3.05bpw` | NVIDIA only, experimental |
 | [EXL3 4.05 bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/4.05bpw) by turboderp | 165.2 GB | in the setup: `--model EXL3-4.05bpw` | NVIDIA only, experimental |
+| [EXL3 Q4 selective](https://huggingface.co/0xSero/GLM-5.3-Flash-EXL3-Q4) by 0xSero | 175 GB | `./maya.sh --gguf-dir <the downloaded folder>` | 4-bit routed experts over four tensor-parallel ranks, everything else BF16; no MTP block - drafts with DFlash2; NVIDIA only, experimental |
 
 </details>
 

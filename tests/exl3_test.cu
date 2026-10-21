@@ -330,6 +330,114 @@ void test_moe(int k2, int cb, int kd = 0) {
     close(("moe K" + kname3(k2, kd) + " cb" + std::to_string(cb)).c_str(), host_copy(d_out, (size_t) E), ref, 3e-3);
 }
 
+// the tensor-parallel decode: one expert's pieces as the tp rank slices flat-concatenated - gate / up hold tp
+// copies of the [E] input scale and the [F] output scale as the ranks' slices, down the transpose - against the
+// CPU reference summing the ranks' standalone matrices
+void test_moe_tp(int k2, int cb) {
+    const int E = 512, F = 1024, TP = 4, nr = F / TP, k = 3;
+    const float limit = 1.5f;
+    HostMat parts[3][3][TP];   // expert, role, rank
+    ex::ExpertLayout lay;
+    lay.cb = cb;
+    lay.tp = TP;
+    std::vector<std::vector<uint8_t>> blobs(3);
+    for (int e = 0; e < 3; ++e) {
+        auto& b = blobs[(size_t) e];
+        size_t at = 0;
+        for (int r = 0; r < 3; ++r) {
+            for (int q = 0; q < TP; ++q)
+                parts[e][r][q] = r < 2 ? make_mat(E, nr, k2, cb) : make_mat(nr, E, k2, cb);
+            const size_t o_suh = at;
+            for (int q = 0; q < TP; ++q) {   // the ranks' input scales, concatenated
+                const std::vector<uint16_t>& s = parts[e][r][q].suh;
+                b.resize(at + s.size() * 2);
+                std::memcpy(&b[at], s.data(), s.size() * 2);
+                at += s.size() * 2;
+            }
+            const size_t o_svh = at;
+            for (int q = 0; q < TP; ++q) {   // the ranks' output scales, concatenated
+                const std::vector<uint16_t>& s = parts[e][r][q].svh;
+                b.resize(at + s.size() * 2);
+                std::memcpy(&b[at], s.data(), s.size() * 2);
+                at += s.size() * 2;
+            }
+            at += 4;
+            const size_t o_tr = at;
+            for (int q = 0; q < TP; ++q) {   // the ranks' trellises, in rank order
+                const std::vector<uint32_t>& t = parts[e][r][q].tr;
+                b.resize(at + t.size() * 4);
+                std::memcpy(&b[at], t.data(), t.size() * 4);
+                at += t.size() * 4;
+            }
+            lay.suh[r] = o_suh;
+            lay.svh[r] = o_svh;
+            lay.trellis[r] = o_tr;
+            lay.k2[r] = k2;
+        }
+    }
+    std::vector<uint8_t*> d_blob(3);
+    for (int e = 0; e < 3; ++e) d_blob[(size_t) e] = dev_copy(blobs[(size_t) e]);
+    std::vector<unsigned long long> plan = {(unsigned long long) d_blob[0], 0ull, (unsigned long long) d_blob[2]};
+    std::vector<float> pw = {0.6f, 0.3f, 0.1f};
+    std::vector<float> x = rand_x(E), cpu_part = rand_x(E), sh = rand_x(E);
+    std::vector<int> flag = {1};
+    auto* d_plan = dev_copy(plan);
+    float* d_pw = dev_copy(pw);
+    float* d_x = dev_copy(x);
+    float* d_cpu = dev_copy(cpu_part);
+    float* d_sh = dev_copy(sh);
+    int* d_flag = dev_copy(flag);
+    float* d_out = nullptr;
+    CK(cudaMalloc(&d_out, (size_t) E * sizeof(float)));
+    ex::MoeArgs a;
+    a.plan_ptr = d_plan;
+    a.plan_w = d_pw;
+    a.cpu_part = d_cpu;
+    a.cpu_flag = d_flag;
+    a.lay = lay;
+    a.k = k;
+    a.n_embd = E;
+    a.n_ff = F;
+    a.limit = limit;
+    for (int rep = 0; rep < 2; ++rep) {
+        ex::moe_gate_up(a, d_x, nullptr, 0);
+        ex::moe_down(a, nullptr, d_sh, d_out, 0);
+    }
+    CK(cudaDeviceSynchronize());
+    std::vector<float> ref((size_t) E, 0.0f);
+    for (int e = 0; e < 3; ++e) {
+        if (plan[(size_t) e] == 0ull) continue;
+        std::vector<float> g((size_t) F), u((size_t) F), hh((size_t) F), dn((size_t) E, 0.0f);
+        for (int r = 0; r < 2; ++r)
+            for (int q = 0; q < TP; ++q) {
+                const HostMat& p = parts[e][r][q];
+                std::vector<float> w((size_t) E * nr);
+                cpu::exl3_inner_k2(p.tr.data(), nr / 16, E, nr, k2, cb, w.data());
+                cpu::exl3_mv(w.data(), p.suh.data(), p.svh.data(), E, nr, x.data(),
+                             (r == 0 ? g : u).data() + (size_t) q * nr);
+            }
+        for (int i = 0; i < F; ++i) {
+            const float gv = std::min(g[(size_t) i], limit), uv = std::min(std::max(u[(size_t) i], -limit), limit);
+            hh[(size_t) i] = gv / (1.0f + std::exp(-gv)) * uv;
+        }
+        for (int q = 0; q < TP; ++q) {
+            const HostMat& p = parts[e][2][q];
+            std::vector<float> w((size_t) nr * E), part((size_t) E);
+            cpu::exl3_inner_k2(p.tr.data(), E / 16, nr, E, k2, cb, w.data());
+            cpu::exl3_mv(w.data(), p.suh.data(), p.svh.data(), nr, E, hh.data() + (size_t) q * nr, part.data());
+            for (int i = 0; i < E; ++i) dn[(size_t) i] += part[(size_t) i];
+        }
+        for (int i = 0; i < E; ++i) ref[(size_t) i] += pw[(size_t) e] * dn[(size_t) i];
+    }
+    for (int i = 0; i < E; ++i) ref[(size_t) i] += cpu_part[(size_t) i] + sh[(size_t) i];
+    close(("moe tp4 K" + kname(k2) + " cb" + std::to_string(cb)).c_str(), host_copy(d_out, (size_t) E), ref,
+          3e-3);
+    for (auto* p : d_blob) cudaFree(p);
+    for (void* p : {(void*) d_plan, (void*) d_pw, (void*) d_x, (void*) d_cpu, (void*) d_sh, (void*) d_flag,
+                    (void*) d_out})
+        cudaFree(p);
+}
+
 void test_recon(int k, int n, int k2, int cb) {
     HostMat h = make_mat(k, n, k2, cb);
     ex::Mat m;
@@ -651,24 +759,32 @@ void test_mv_n(int k, int n, int k2, int cb, bool q8, int ncol) {
 // a verify window's routed experts (win_experts: each distinct expert once for its tokens) against each token's
 // moe_gate_up + moe_down: the same bits.  T tokens, k plan entries each over a few experts (shared ones, a skipped
 // entry, a token whose CPU-lane flag is off)
-void test_win(int k2, int cb, int T, int kd = 0) {
+void test_win(int k2, int cb, int T, int kd = 0, int tp = 1) {
     if (kd <= 0) kd = k2;
-    const int E = 512, F = 384, k = 4, NX = 5;
+    const int E = 512, F = tp > 1 ? 1024 : 384, k = 4, NX = 5;
     const float limit = 1.5f;
     ex::ExpertLayout lay;
     lay.cb = cb;
+    lay.tp = tp;
     std::vector<uint8_t*> d_blob((size_t) NX);
     for (int e = 0; e < NX; ++e) {
         std::vector<uint8_t> b;
         size_t at = 0;
         for (int r = 0; r < 3; ++r) {
-            const HostMat p = r < 2 ? make_mat(E, F, k2, cb) : make_mat(F, E, kd, cb);
-            const size_t o_suh = at, o_svh = o_suh + p.suh.size() * 2, o_tr = o_svh + p.svh.size() * 2 + 4;
-            at = o_tr + p.tr.size() * 4;
+            // one standalone matrix per rank; the pieces are the rank slices flat-concatenated (tp > 1)
+            std::vector<HostMat> ps;
+            for (int q = 0; q < tp; ++q)
+                ps.push_back(r < 2 ? make_mat(E, F / tp, k2, cb) : make_mat(F / tp, E, kd, cb));
+            const size_t o_suh = at, o_svh = o_suh + [&] { size_t n = 0; for (auto& p : ps) n += p.suh.size() * 2; return n; }();
+            const size_t o_tr = o_svh + [&] { size_t n = 0; for (auto& p : ps) n += p.svh.size() * 2; return n; }() + 4;
+            at = o_tr + [&] { size_t n = 0; for (auto& p : ps) n += p.tr.size() * 4; return n; }();
             b.resize(at);
-            std::memcpy(&b[o_suh], p.suh.data(), p.suh.size() * 2);
-            std::memcpy(&b[o_svh], p.svh.data(), p.svh.size() * 2);
-            std::memcpy(&b[o_tr], p.tr.data(), p.tr.size() * 4);
+            size_t w = o_suh;
+            for (auto& p : ps) { std::memcpy(&b[w], p.suh.data(), p.suh.size() * 2); w += p.suh.size() * 2; }
+            w = o_svh;
+            for (auto& p : ps) { std::memcpy(&b[w], p.svh.data(), p.svh.size() * 2); w += p.svh.size() * 2; }
+            w = o_tr;
+            for (auto& p : ps) { std::memcpy(&b[w], p.tr.data(), p.tr.size() * 4); w += p.tr.size() * 4; }
             lay.suh[r] = o_suh;
             lay.svh[r] = o_svh;
             lay.trellis[r] = o_tr;
@@ -1453,6 +1569,8 @@ int main(int argc, char** argv) {
     test_batch();
     for (int k2 : {4, 6, 8}) test_moe(k2, 2);
     test_moe(6, 1);
+    test_moe_tp(6, 2);   // the TP4 decode against the CPU reference (the Maya-XL checkpoint's geometry)
+    test_moe_tp(4, 2);
     for (int k2 : {4, 10}) test_recon(256, 384, k2, 2);
     test_recon(256, 256, 6, 0);
     for (int k2 = 2; k2 <= 16; k2 += 2) test_rot_rows(256, 384, k2, 2);
@@ -1473,6 +1591,7 @@ int main(int argc, char** argv) {
     for (int k2 : {4, 6, 8, 16}) test_win(k2, 2, 7);
     test_win(6, 1, 2);
     test_win(6, 2, 16);
+    test_win(6, 2, 7, 0, 4);   // the TP4 window against the TP4 token path
     for (int k2 : {2, 6, 12, 16}) test_cpu_n(512, 256, k2);
     for (int k2 : {4, 6, 8, 10, 16}) test_cpu_rows(512, 384, k2);
     for (int k2 : {6, 8, 12}) test_cpu_gemm(768, 256, k2);

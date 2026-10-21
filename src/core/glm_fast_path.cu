@@ -705,7 +705,9 @@ bool Glm5Model::fast_setup(std::string& err) {
             return it->second;
         };
         // a projection a GGUF keeps unquantized (BF16 - e.g. attn_kv_a_mqa in some community GGUFs) where Maya's
-        // quants quantize it: the BF16 copy; the jobs that take these pass the float activation as well
+        // quants quantize it - or a selective EXL3 pack keeps in source precision (tools/exl3_pack.py, Maya-XL):
+        // the BF16 copy; the jobs that take these pass the float activation as well, or the mv kernel answers a
+        // BF16 row against the q8_1 one (row_dot_bf16_q8)
         const auto q_or_b16 = [&](const char* n, int64_t n_in, int64_t n_out) -> WSlot {
             const auto it = ws_map_.find(P + n);
             if (it == ws_map_.end() || it->second.type == 0) {
@@ -719,7 +721,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         Ly.mtp = is_mtp;
         if (is_mtp) {
             // no hyper-connections: eh_proj in, plain residuals, the shared head's norm out
-            Ly.eh = q("nextn.eh_proj.weight");
+            Ly.eh = q_or_b16("nextn.eh_proj.weight", 2 * g.n_embd, g.n_embd);
             Ly.enorm = f32("nextn.enorm.weight");
             Ly.hnorm = f32("nextn.hnorm.weight");
             Ly.shnorm = f32("nextn.shared_head_norm.weight");
@@ -734,9 +736,9 @@ bool Glm5Model::fast_setup(std::string& err) {
         Ly.attn_norm = f32("attn_norm.weight");
         Ly.ffn_norm = f32("ffn_norm.weight");
         if (Ly.recr) {
-            Ly.q = q("attn_q.weight");
-            Ly.k = q("attn_k.weight");
-            Ly.v = q("attn_v.weight");
+            Ly.q = q_or_b16("attn_q.weight", g.n_embd, g.d_inner());
+            Ly.k = q_or_b16("attn_k.weight", g.n_embd, g.d_inner());
+            Ly.v = q_or_b16("attn_v.weight", g.n_embd, g.d_inner());
             Ly.f_a = b16("ssm_f_a.weight");
             Ly.g_a = b16("ssm_g_a.weight");
             Ly.f_b = b16("ssm_f_b.weight");
@@ -750,7 +752,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.ssm_norm = f32("ssm_norm.weight");
         } else {
             Ly.q_a = q_or_b16("attn_q_a.weight", g.n_embd, g.q_lora);
-            Ly.q_b = q("attn_q_b.weight");
+            Ly.q_b = q_or_b16("attn_q_b.weight", g.q_lora, g.n_head * g.qk_nope);
             Ly.kv_a = q_or_b16("attn_kv_a_mqa.weight", g.n_embd, g.kv_lora);
             Ly.q_a_norm = f32("attn_q_a_norm.weight");
             Ly.kv_a_norm = f32("attn_kv_a_norm.weight");
@@ -768,13 +770,13 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.k_b = b16("attn_k_b.weight");
             Ly.v_b = b16("attn_v_b.weight");
         }
-        Ly.out = q("attn_output.weight");
+        Ly.out = q_or_b16("attn_output.weight", g.d_inner(), g.n_embd);
         if (Ly.moe) {
             Ly.router = b16("ffn_gate_inp.weight");
             Ly.router_bias = f32("exp_probs_b.bias");
-            Ly.sh_gate = q("ffn_gate_shexp.weight");
-            Ly.sh_up = q("ffn_up_shexp.weight");
-            Ly.sh_down = q("ffn_down_shexp.weight");
+            Ly.sh_gate = q_or_b16("ffn_gate_shexp.weight", g.n_embd, g.n_ff_exp * g.n_shared);
+            Ly.sh_up = q_or_b16("ffn_up_shexp.weight", g.n_embd, g.n_ff_exp * g.n_shared);
+            Ly.sh_down = q_or_b16("ffn_down_shexp.weight", g.n_ff_exp * g.n_shared, g.n_embd);
             const auto& nl = pack_layers_[(size_t) il];
             if (nl.layer < 0) {
                 missing += P + "native experts ";
@@ -787,6 +789,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                 Ly.down_off = 2 * Ly.gu_bytes;
                 Ly.blob = 2 * Ly.gu_bytes + Ly.dn_bytes;
                 Ly.xl.cb = nl.x_cb;
+                Ly.xl.tp = nl.x_tp;
                 for (int r = 0; r < 3; ++r) {
                     const size_t base = r == 0 ? 0 : r == 1 ? Ly.gu_bytes : Ly.down_off;
                     Ly.xl.trellis[r] = base;
@@ -807,9 +810,9 @@ bool Glm5Model::fast_setup(std::string& err) {
                     missing += P + "expert types " + std::to_string(Ly.gu_type) + "/" + std::to_string(Ly.d_type) + " ";
             }
         } else {
-            Ly.ffn_gate = q("ffn_gate.weight");
-            Ly.ffn_up = q("ffn_up.weight");
-            Ly.ffn_down = q("ffn_down.weight");
+            Ly.ffn_gate = q_or_b16("ffn_gate.weight", g.n_embd, g.n_ff_dense);
+            Ly.ffn_up = q_or_b16("ffn_up.weight", g.n_embd, g.n_ff_dense);
+            Ly.ffn_down = q_or_b16("ffn_down.weight", g.n_ff_dense, g.n_embd);
         }
     }
     if (!missing.empty()) {
@@ -2742,7 +2745,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         if (!Ly.moe || Ly.mtp) continue;
         if (Ly.exl3) {
             // EXL3: the CPU kernel takes the mul1 codebook (the others stay on the PCIe lane); n_ff marks the layer
-            if (Ly.xl.cb == 2) {
+            if (Ly.xl.cb == 2 && Ly.xl.tp == 1) {
                 auto& f = F->cpu_fmt[(size_t) il];
                 f.gu_type = f.d_type = strata::kernels::exl3::kTypeEXL3;
                 f.n_embd = g.n_embd;
@@ -4320,9 +4323,9 @@ void Glm5Model::fast_service() {
     }
 }
 
-// a whole EXL3 expert into its blob: the nine pieces sorted by file offset, those less than 64 KB apart read as one
-// range through a bounce buffer (the 3.05 bpw files keep an expert's three trellises together and its scales elsewhere:
-// two reads instead of nine; files that keep the whole expert together: one)
+// a whole EXL3 expert into its blob: the nine pieces' sources - a tensor-parallel piece is its rank slices - sorted by
+// file offset, those less than 64 KB apart read as one range through a bounce buffer (the 4.0 bpw TP4 files keep an
+// expert's pieces close together: a few reads instead of up to 27)
 void Glm5Model::fast_read_expert_x3(int il, int e, uint8_t* blob) {
     const auto& Ly = fast_->L[(size_t) il];
     const auto& nl = pack_layers_[(size_t) il];
@@ -4331,21 +4334,26 @@ void Glm5Model::fast_read_expert_x3(int il, int e, uint8_t* blob) {
         uint64_t off;
         size_t len;
         uint8_t* dst;
-    } p[9];
+    } p[64];
+    int np = 0;
     for (int r = 0; r < 3; ++r) {
         uint8_t* at = blob + (r == 0 ? 0 : r == 1 ? Ly.gu_bytes : Ly.down_off);
         for (int j = 0; j < 3; ++j) {
-            const size_t i = (size_t) e * 9 + (size_t) r * 3 + (size_t) j;
-            p[r * 3 + j] = Piece{nl.x_shard[i], nl.x_off[i], nl.x_piece(r, j), at};
-            at += nl.x_piece(r, j);
+            const size_t pi = (size_t) e * 9 + (size_t) r * 3 + (size_t) j;
+            size_t d = 0;
+            for (size_t s = nl.x_pstart[pi]; s < nl.x_pstart[pi + 1]; ++s) {
+                p[np++] = Piece{nl.x_src_shard[s], nl.x_src_off[s], (size_t) nl.x_src_len[s], at + d};
+                d += (size_t) nl.x_src_len[s];
+            }
+            at += d;
         }
     }
-    std::sort(p, p + 9, [](const Piece& a, const Piece& b) { return std::make_pair(a.sh, a.off) < std::make_pair(b.sh, b.off); });
+    std::sort(p, p + np, [](const Piece& a, const Piece& b) { return std::make_pair(a.sh, a.off) < std::make_pair(b.sh, b.off); });
     static thread_local std::vector<uint8_t> bounce;
-    for (int a = 0; a < 9;) {
+    for (int a = 0; a < np;) {
         int b = a + 1;
         uint64_t end = p[a].off + p[a].len;
-        while (b < 9 && p[b].sh == p[a].sh && p[b].off <= end + (64u << 10)) {
+        while (b < np && p[b].sh == p[a].sh && p[b].off <= end + (64u << 10)) {
             end = std::max<uint64_t>(end, p[b].off + p[b].len);
             ++b;
         }
@@ -4367,19 +4375,34 @@ void Glm5Model::fast_read_part(int il, int e, int role, uint8_t* blob, int chunk
     const auto& Ly = fast_->L[(size_t) il];
     const auto& nl = pack_layers_[(size_t) il];
     if (nl.x_cb >= 0) {
-        // EXL3: the part's three pieces (trellis, suh, svh) from wherever the safetensors keep them; the chunks split
-        // the trellis, the scales come with the first
+        // EXL3: the part's three pieces (trellis, suh, svh) from wherever the safetensors keep them - a
+        // tensor-parallel piece is its rank slices, concatenated in order; the chunks split the trellis, the
+        // scales come with the first
         size_t at = role == 0 ? 0 : role == 1 ? Ly.gu_bytes : Ly.down_off;
         for (int j = 0; j < 3; ++j) {
-            const size_t i = (size_t) e * 9 + (size_t) role * 3 + (size_t) j;
+            const size_t pi = (size_t) e * 9 + (size_t) role * 3 + (size_t) j;
             const size_t len = nl.x_piece(role, j);
-            const Shard& xs = pack_shards_[(size_t) nl.x_shard[i]];
             if (j == 0) {
                 const size_t piece = ((len + (size_t) n_chunks - 1) / (size_t) n_chunks + 4095) & ~(size_t) 4095;
                 const size_t c0 = std::min(len, (size_t) chunk * piece), c1 = std::min(len, c0 + piece);
-                if (c1 > c0) read_slice(xs, nl.x_off[i] + c0, c1 - c0, blob + at + c0);
+                if (c1 > c0) {
+                    size_t d = 0;
+                    for (size_t s = nl.x_pstart[pi]; s < nl.x_pstart[pi + 1]; ++s) {
+                        const size_t l = (size_t) nl.x_src_len[s];
+                        const size_t t0 = std::max(c0, d), t1 = std::min(c1, d + l);
+                        if (t1 > t0)
+                            read_slice(pack_shards_[(size_t) nl.x_src_shard[s]], nl.x_src_off[s] + (t0 - d), t1 - t0,
+                                       blob + at + t0);
+                        d += l;
+                    }
+                }
             } else if (chunk == 0) {
-                read_slice(xs, nl.x_off[i], len, blob + at);
+                size_t d = 0;
+                for (size_t s = nl.x_pstart[pi]; s < nl.x_pstart[pi + 1]; ++s) {
+                    const size_t l = (size_t) nl.x_src_len[s];
+                    read_slice(pack_shards_[(size_t) nl.x_src_shard[s]], nl.x_src_off[s], l, blob + at + d);
+                    d += l;
+                }
             }
             at += len;
         }

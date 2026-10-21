@@ -379,6 +379,8 @@ struct X3Lane {
     cublasHandle_t blas = nullptr;
     uint16_t* w16 = nullptr;          // the weight scratch, w16_elems FP16 values
     int64_t w16_elems = 0;
+    float* w32 = nullptr;             // the F32 scratch, w32_elems floats (a tp > 1 down's rank partials)
+    int64_t w32_elems = 0;
     const float* x = nullptr;         // the chunk's FFN inputs (n_embd floats a token)
     const int* row_tok = nullptr;     // sorted row -> its token
     float* OUTP = nullptr;            // the output window, W rows
@@ -432,74 +434,152 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
     const float one = 1.0f, zero = 0.0f;
     const int E = L.E, nff = L.nff;
     const cudaStream_t s = L.s;
+    const int tp = L.lay->tp;   // the blob's rank slices flat-concatenated: gate / up split the outputs over the
+    // whole input, down the transpose (each rank q's suh / svh its own, its trellis a standalone matrix)
+    const int nq = tp > 1 ? nff / tp : nff;   // rank q's gate / up outputs
+    const int kq = nq;                        // rank q's down inputs
     const int64_t wgu = (int64_t) 2 * nff * E, wdn = (int64_t) E * nff;
     const int gu_rows = (int) std::max<int64_t>(1, (L.w16_elems - wgu) / (rot_rows ? 2 * E : E));
-    const int dn_rows = (int) std::max<int64_t>(1, (L.w16_elems - wdn) / nff);
-    const auto mat = [&](int r) {
+    // the down's partials sum in the F32 scratch (tp > 1: one per rank plus the running sum; rot_rows: always the
+    // raw part and, with ranks, the sum), so the chunk rows must fit there
+    const int dn_rows =
+        std::min<int>((int) std::max<int64_t>(1, (L.w16_elems - wdn) / nff),
+                      rot_rows || tp > 1
+                          ? (int) std::max<int64_t>(1, L.w32_elems / ((int64_t) E * (rot_rows && tp > 1 ? 2 : 1)))
+                          : std::numeric_limits<int>::max());
+    const auto mat = [&](int r, int q) {
         x3::Mat m;
-        m.trellis = (const uint32_t*) (blob + L.lay->trellis[r]);
-        m.suh = (const uint16_t*) (blob + L.lay->suh[r]);
-        m.svh = (const uint16_t*) (blob + L.lay->svh[r]);
-        m.k = r < 2 ? E : nff;
-        m.n = r < 2 ? nff : E;
+        m.trellis = (const uint32_t*) (blob + L.lay->trellis[r] +
+                                       (size_t) q * (r < 2 ? E : kq) * (r < 2 ? nq : E) * L.lay->k2[r] / 16);
+        m.suh = (const uint16_t*) (blob + L.lay->suh[r] + (size_t) q * 2 * (r < 2 ? E : kq));
+        m.svh = (const uint16_t*) (blob + L.lay->svh[r] + (size_t) q * 2 * (r < 2 ? nq : E));
+        m.k = r < 2 ? E : kq;
+        m.n = r < 2 ? nq : E;
         m.k2 = L.lay->k2[r];
         m.cb = L.lay->cb;
         return m;
     };
     const int o = L.place(r0 + a, nrows);
     float* GU = L.OUTP + (size_t) o * E;   // 2 * n_ff == n_embd: the expert's own OUTP rows hold its gate/up
+    std::string err;
     if (rot_rows) {
-        // gate and up: W' of each, the rows rotated by each one's suh, the outputs by its svh
-        for (int r = 0; r < 2; ++r) x3::reconstruct_inner_rows(mat(r), L.w16 + (size_t) r * nff * E, s);
+        // gate and up: W' of each rank slice, the rows rotated by the slice's suh, the outputs by its svh
+        for (int r = 0; r < 2; ++r)
+            for (int q = 0; q < tp; ++q)
+                x3::reconstruct_inner_rows(mat(r, q), L.w16 + ((size_t) r * nff + (size_t) q * nq) * E, s);
         uint16_t* X16 = L.w16 + wgu;
         for (int c0 = 0; c0 < nrows; c0 += gu_rows) {
             const int n = std::min(gu_rows, nrows - c0);
             for (int r = 0; r < 2; ++r) {
                 uint16_t* Xr = X16 + (size_t) r * gu_rows * E;
-                x3::rows_rot_f16(L.x, E, L.row_tok + r0 + a + c0, n, E, mat(r).suh, Xr, s);
-                blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, nff, n, E, &one,
-                                     L.w16 + (size_t) r * nff * E, CUDA_R_16F, E, Xr, CUDA_R_16F, E, &zero,
-                                     GU + (size_t) c0 * E + (size_t) r * nff, CUDA_R_32F, E,
-                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                        "gemm exl3 gate/up");
+                for (int q = 0; q < tp; ++q) {
+                    x3::rows_rot_f16(L.x, E, L.row_tok + r0 + a + c0, n, E, mat(r, q).suh, Xr, s);
+                    blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, nq, n, E, &one,
+                                         L.w16 + ((size_t) r * nff + (size_t) q * nq) * E, CUDA_R_16F, E, Xr,
+                                         CUDA_R_16F, E, &zero, GU + (size_t) c0 * E + (size_t) r * nff +
+                                                                 (size_t) q * nq,
+                                         CUDA_R_32F, E, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                            "gemm exl3 gate/up");
+                }
+                for (int q = 0; q < tp; ++q)
+                    x3::rows_rot_out(GU + (size_t) c0 * E + (size_t) r * nff + (size_t) q * nq, E, n, nq,
+                                     mat(r, q).svh, s);
             }
         }
-        for (int r = 0; r < 2; ++r) x3::rows_rot_out(GU + (size_t) r * nff, E, nrows, nff, mat(r).svh, s);
         gb::swiglu_rows(GU, GU, nrows, nff, L.limit, s, 2 * nff);
-        x3::reconstruct_inner_rows(mat(2), L.w16, s);
+        uint16_t* H16 = L.w16 + wdn;
+        // tp > 1: every rank's down slice keeps its own weight region (the wdn block holds all of them:
+        // tp * E * kq == E * nff) and the rank loop runs inside the row chunk - the down's GEMM writes its
+        // E-wide result over the very OUTP rows that hold h, so all the slices must be read before any of
+        // them is overwritten.  The sum accumulates in the F32 scratch and is published after the chunk.
+        for (int q = 0; q < tp; ++q)
+            x3::reconstruct_inner_rows(mat(2, q), L.w16 + (size_t) q * E * kq, s);
+        for (int c0 = 0; c0 < nrows; c0 += dn_rows) {
+            const int n = std::min(dn_rows, nrows - c0);
+            float* A = L.w32;                        // the running sum
+            float* P = L.w32 + (size_t) dn_rows * E; // rank q > 0's partial, before it joins A
+            for (int q = 0; q < tp; ++q) {
+                x3::rows_rot_f16(GU + (size_t) c0 * E + (size_t) q * kq, E, nullptr, n, kq, mat(2, q).suh, H16, s);
+                float* dst = q == 0 ? A : P;
+                blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, kq, &one,
+                                     L.w16 + (size_t) q * E * kq, CUDA_R_16F, kq, H16, CUDA_R_16F, kq, &zero,
+                                     dst, CUDA_R_32F, E, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                        "gemm exl3 down");
+                x3::rows_rot_out(dst, E, n, E, mat(2, q).svh, s);
+                if (q > 0) x3::rows_add_f32(A, E, P, E, n, E, s);
+            }
+            if (!glmfast::cuda_ok(cudaMemcpyAsync(GU + (size_t) c0 * E, A, (size_t) n * E * sizeof(float),
+                                                  cudaMemcpyDeviceToDevice, s), "publish exl3 down", err)) {
+                std::fprintf(stderr, "glm prefill: %s\n", err.c_str());
+                return;
+            }
+        }
+        return;
+    }
+    if (tp == 1) {
+        x3::reconstruct_rows(mat(0, 0), L.w16, false, s);
+        x3::reconstruct_rows(mat(1, 0), L.w16 + (size_t) nff * E, false, s);
+        uint16_t* X16 = L.w16 + wgu;
+        for (int c0 = 0; c0 < nrows; c0 += gu_rows) {
+            const int n = std::min(gu_rows, nrows - c0);
+            x3::rows_f16(L.x, E, L.row_tok + r0 + a + c0, n, E, X16, s);
+            blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, L.w16, CUDA_R_16F, E, X16,
+                                 CUDA_R_16F, E, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
+                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                    "gemm exl3 gate/up");
+        }
+        gb::swiglu_rows(GU, GU, nrows, nff, L.limit, s, 2 * nff);
+        x3::reconstruct_rows(mat(2, 0), L.w16, false, s);
         uint16_t* H16 = L.w16 + wdn;
         for (int c0 = 0; c0 < nrows; c0 += dn_rows) {
             const int n = std::min(dn_rows, nrows - c0);
-            x3::rows_rot_f16(GU + (size_t) c0 * E, E, nullptr, n, nff, mat(2).suh, H16, s);
-            blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, L.w16, CUDA_R_16F, nff,
-                                 H16, CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E,
+            x3::rows_f16(GU + (size_t) c0 * E, E, nullptr, n, nff, H16, s);
+            blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, L.w16, CUDA_R_16F, nff, H16,
+                                 CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E,
                                  CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
                     "gemm exl3 down");
         }
-        x3::rows_rot_out(GU, E, nrows, E, mat(2).svh, s);
         return;
     }
-    x3::reconstruct_rows(mat(0), L.w16, false, s);
-    x3::reconstruct_rows(mat(1), L.w16 + (size_t) nff * E, false, s);
+    for (int q = 0; q < tp; ++q) x3::reconstruct_rows(mat(0, q), L.w16 + (size_t) q * nq * E, false, s);
+    for (int q = 0; q < tp; ++q)
+        x3::reconstruct_rows(mat(1, q), L.w16 + ((size_t) nff + (size_t) q * nq) * E, false, s);
     uint16_t* X16 = L.w16 + wgu;
     for (int c0 = 0; c0 < nrows; c0 += gu_rows) {
         const int n = std::min(gu_rows, nrows - c0);
         x3::rows_f16(L.x, E, L.row_tok + r0 + a + c0, n, E, X16, s);
-        blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, L.w16, CUDA_R_16F, E,
-                             X16, CUDA_R_16F, E, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
-                             CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                "gemm exl3 gate/up");
+        for (int r = 0; r < 2; ++r)
+            for (int q = 0; q < tp; ++q)
+                blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, nq, n, E, &one,
+                                     L.w16 + ((size_t) r * nff + (size_t) q * nq) * E, CUDA_R_16F, E, X16,
+                                     CUDA_R_16F, E, &zero, GU + (size_t) c0 * E + (size_t) r * nff +
+                                                             (size_t) q * nq,
+                                     CUDA_R_32F, E, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                        "gemm exl3 gate/up");
     }
     gb::swiglu_rows(GU, GU, nrows, nff, L.limit, s, 2 * nff);
-    x3::reconstruct_rows(mat(2), L.w16, false, s);
+    // tp > 1: as in the rot_rows branch, the rank loop runs inside the row chunk (the down's GEMM would
+    // overwrite the h the later ranks read); these weights carry the rotations, so the partials sum in A
+    // with beta and only the sum is published
+    for (int q = 0; q < tp; ++q)
+        x3::reconstruct_rows(mat(2, q), L.w16 + (size_t) q * E * kq, false, s);
     uint16_t* H16 = L.w16 + wdn;
     for (int c0 = 0; c0 < nrows; c0 += dn_rows) {
         const int n = std::min(dn_rows, nrows - c0);
-        x3::rows_f16(GU + (size_t) c0 * E, E, nullptr, n, nff, H16, s);
-        blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, L.w16, CUDA_R_16F, nff, H16,
-                             CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
-                             CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                "gemm exl3 down");
+        float* A = L.w32;
+        for (int q = 0; q < tp; ++q) {
+            x3::rows_f16(GU + (size_t) c0 * E + (size_t) q * kq, E, nullptr, n, kq, H16, s);
+            const float* beta = q == 0 ? &zero : &one;
+            blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, kq, &one,
+                                 L.w16 + (size_t) q * E * kq, CUDA_R_16F, kq, H16, CUDA_R_16F, kq, beta, A,
+                                 CUDA_R_32F, E, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                    "gemm exl3 down");
+        }
+        if (!glmfast::cuda_ok(cudaMemcpyAsync(GU + (size_t) c0 * E, A, (size_t) n * E * sizeof(float),
+                                              cudaMemcpyDeviceToDevice, s), "publish exl3 down", err)) {
+            std::fprintf(stderr, "glm prefill: %s\n", err.c_str());
+            return;
+        }
     }
 }
 // one set's experts in set order (the window takes the rows in order): runs of light experts to the tensor cores, the
@@ -861,6 +941,8 @@ bool Glm5Model::prefill_calc(const CalcJob& J, std::string& err) {
     L.blas = S->blas;
     L.w16 = S->w16;
     L.w16_elems = S->w16_elems;
+    L.w32 = S->w32;
+    L.w32_elems = S->w32_elems;
     L.x = cb.x;
     L.row_tok = cb.row_tok;
     L.OUTP = cb.win;
@@ -2944,7 +3026,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         } x3_join{x3_th};
         bool x3_ok = true;
         auto x3_t0 = std::chrono::steady_clock::now(), x3_t1 = x3_t0;
-        if (cpu_nrows > 0 && Ly.exl3)
+        if (cpu_nrows > 0 && Ly.exl3 && Ly.xl.cb == 2)
             x3_th = std::thread([&] {
                 cudaSetDevice(dev_);
                 x3_t0 = std::chrono::steady_clock::now();
@@ -3121,6 +3203,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         x3l.blas = S->blas;
         x3l.w16 = S->w16;
         x3l.w16_elems = S->w16_elems;
+        x3l.w32 = S->w32;
+        x3l.w32_elems = S->w32_elems;
         x3l.x = S->x;
         x3l.row_tok = M.row_tok;
         x3l.OUTP = M.OUTP;

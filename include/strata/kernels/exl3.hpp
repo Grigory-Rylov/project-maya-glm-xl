@@ -99,6 +99,8 @@ struct ExpertLayout {
     int cb = 2;
     int fmt = 0;   // 2: a GGUF's MXFP4 expert (maya-ds4's own kernels): trellis[r] = matrix r's offset, [out][in / 32]
     int gg_type[3] = {0, 0, 0};   // fmt 2: each role's ggml type (0: MXFP4; maya-ds4's expert_type)
+    int tp = 1;   // tensor-parallel ranks: gate / up split the outputs (tp per-rank input scale copies, the svh the
+                  // ranks' output slices concatenated); down the transpose (the suh concatenated, tp output copies)
 };
 /// The routed experts of one token (the engine's device plan: plan_ptr[i] = the blob in VRAM, 0 = not on the device;
 /// plan_w[i] its weight).  gate/up over x (n_embd F32) -> clamped swiglu -> h (F32 [k][n_ff], scratch the caller
@@ -189,6 +191,9 @@ void reconstruct_inner(const Mat& m, uint16_t* dst, cudaStream_t s);
 /// out[r][c] = FP16(x[idx ? idx[r] : r][c]) for r < nrows, c < ncols (x: ldx floats a row): the prompt path's rows of
 /// one expert, gathered for its GEMMs.
 void rows_f16(const float* x, int ldx, const int* idx, int nrows, int ncols, uint16_t* out, cudaStream_t s);
+/// dst[r][c] += src[r][c] for r < nrows, c < ncols (row-major, ldd/lds floats a row): adds one TP slice's down
+/// partial to the running sum.
+void rows_add_f32(float* dst, int ldd, const float* src, int lds, int nrows, int ncols, cudaStream_t s);
 
 /// Launch failures of this family since the process started (each is also printed).
 int launch_errors();

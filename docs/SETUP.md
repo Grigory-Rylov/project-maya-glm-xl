@@ -80,7 +80,7 @@ is not downloaded again, and your settings stay. By hand: `git pull`, then `./se
 | --- | --- |
 | `--setup` | set up again (other GPUs, context, model folder) |
 | `--check` | only check the PC |
-| `--gguf-dir DIR` | use GLM-5.3-Flash GGUF files you already have: their folder, or the `.gguf` file (the first one of a split model) when the folder holds several models. The folder must be writable: the pack goes inside it |
+| `--gguf-dir DIR` | use a GLM-5.3-Flash model you already have: the folder with its GGUF files or its EXL3 safetensors (a `config.json` with `quantization_config` tells the two apart), or the `.gguf` file (the first one of a split model) when the folder holds several models. The folder must be writable: the pack goes inside it |
 | `--models-dir DIR` | where downloaded models go, each in a folder named after it - `DIR/Maya-L/` holds that model's GGUF files (default `../Maya-data/models`); put it on the NVMe |
 | `--download-model` | download the model without asking (the commands and size are still printed) |
 | `--model NAME` | which model, without asking: `DeepSeek-V4.1-Flash-1017`, or a GLM-5.3-Flash download: `Maya-S-v2-IQ2_XXS` (Maya-S), `Maya-S24`, `Maya-M`, `Maya-M-Derisked`, `Maya-L`, or `EXL3-3.05bpw` / `EXL3-4.05bpw` - an experimental EXL3 quant at 3.05 or 4.05 bits per weight ([3.05bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/3.05bpw), 125.3 GB; [4.05bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/4.05bpw), 165.2 GB; both with the MTP block) that the engine reads in place from its safetensors: NVIDIA only, 3.05bpw tested on Linux, neither measured against the FP8 model |

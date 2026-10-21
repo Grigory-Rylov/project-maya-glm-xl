@@ -32,8 +32,8 @@ no tuning step - it balances its own split):
      and NVIDIA only)
   3. Python packages into .venv, llama.cpp's source at the pinned commit (it lists them and asks first)
   4. compiles the engine (`build/maya`, or `build-hip/maya`) for your GPU(s): 10-30 minutes, once
-  5. the model: GGUF files you already have (--gguf-dir), or a download it shows you first - the exact commands
-     and the size - and starts only after you answer y (or pass --download-model)
+  5. the model: GGUF files or an EXL3 folder you already have (--gguf-dir), or a download it shows you first - the
+     exact commands and the size - and starts only after you answer y (or pass --download-model)
   6. builds the pack (the engine's index of the model files) inside the model folder
   7. images: compiles the vision encoder (`build-vision/bin/maya-vision`) and fetches the model's vision files
      (1.1 GB, shown and asked first like the model; --no-vision and HIP skip it)
@@ -1146,6 +1146,20 @@ def is_exl3(quant: str) -> bool:
     return MODELS.get(quant, {}).get("format") == "exl3"
 
 
+EXL3_METHODS = ("exl3", "exl3_selective_tp4")     # what tools/exl3_pack.py reads in place
+
+
+def exl3_dir(p: Path):
+    """`p` when it is a GLM-5.3-Flash EXL3 checkpoint (a config.json + safetensors folder the packer reads in
+    place), else None.  A selective one (exl3_selective_tp4) trellis-codes only the routed experts."""
+    conf = read_json(p / "config.json")
+    q = conf.get("quantization_config") or {}
+    if (conf.get("architectures") or [""])[0] == "Glm5NextForConditionalGeneration" and \
+            q.get("quant_method") in EXL3_METHODS:
+        return p
+    return None
+
+
 def old_names(m: dict) -> list:
     """The names a model's files had on Hugging Face before ("was", newest first), each as its list of shards."""
     return [shard_names(m, p) for p in m.get("was") or []]
@@ -1181,7 +1195,7 @@ def download_dir(models: Path, quant: str) -> Path:
     return d
 
 
-def choose_draft(a, pc: dict, inst: dict) -> str:
+def choose_draft(a, pc: dict, inst: dict, choice: tuple | None = None) -> str:
     """"mtp" (the model's own MTP block; the default) or "dflash2" (a DFlash2 drafter, downloaded in step 5): --draft,
     else asked - the earlier setup's answer is the default.  AMD (HIP) setups keep MTP: DFlash2 is measured on NVIDIA.
     So do NVIDIA GPUs before sm_80 (RTX 30 / A100): on Tesla V100s DFlash2 decoded slower than the MTP block (one GPU
@@ -1189,6 +1203,12 @@ def choose_draft(a, pc: dict, inst: dict) -> str:
     where it is faster."""
     if getattr(a, "draft", None):
         return a.draft
+    if choice and choice[0] == "local-exl3" and \
+            (read_json(choice[1] / "config.json").get("quantization_config") or {}).get("quant_method") == \
+            "exl3_selective_tp4":
+        ok("a selective EXL3 checkpoint keeps its NextN block in source precision: the pack carries no MTP block, "
+           "so a DFlash2 drafter drafts")
+        return "dflash2"
     if pc.get("backend") == "hip":
         return "mtp"
     if pc.get("archs") and min(int(x) for x in pc["archs"]) < 80:
@@ -1246,12 +1266,17 @@ def choose_family(a, prev: dict) -> str:
 
 
 def choose_model(a, models: Path, inst: dict) -> tuple:
-    """("download", one of MODELS) or ("local", the model's first .gguf file): --gguf-dir, --model, else asked among
-    the downloads - the earlier download is the default."""
+    """("download", one of MODELS), ("local", the model's first .gguf file) or ("local-exl3", its EXL3 folder):
+    --gguf-dir, --model, else asked among the downloads - the earlier download is the default."""
     if a.gguf_dir:
+        p = Path(a.gguf_dir).expanduser().resolve()
+        d = p if p.is_dir() else p.parent
+        if exl3_dir(d):
+            return "local-exl3", d
         first, why = local_first(Path(a.gguf_dir))
         if first is None:
-            fail(why, "--gguf-dir takes the folder that holds the GLM-5.3-Flash .gguf files, or the (first) .gguf file")
+            fail(why, "--gguf-dir takes the folder that holds the GLM-5.3-Flash .gguf files or EXL3 safetensors, "
+                      "or the (first) .gguf file")
         return "local", first
     if a.model:
         return "download", a.model
@@ -1926,7 +1951,19 @@ def model_step(a, models: Path, choice: tuple):
     """(model folder, shards, quant name), or None when the files are not there and were not downloaded."""
     step(5, "the model (GLM-5.3-Flash)")
     kind, what = choice
-    if kind == "local":
+    if kind == "local-exl3":
+        d = what
+        conf = read_json(d / "config.json")
+        method = (conf.get("quantization_config") or {}).get("quant_method")
+        if conf.get("model_type") != "glm5_next" or method not in EXL3_METHODS:
+            fail(f"{d / 'config.json'}: a {conf.get('model_type')!r} model quantized as {method!r}, not GLM-5.3-Flash "
+                 f"in EXL3 (glm5_next, {' or '.join(EXL3_METHODS)})")
+        shards = sorted(d.rglob("*.safetensors"))
+        if not shards:
+            fail(f"{d}: no safetensors in it - the download never started")
+        quant = d.name
+        warn(f"{quant}: experimental - only {', '.join(MODELS)} has been measured with Maya (README.md)")
+    elif kind == "local":
         shards, quant, d = shard_set(what), quant_of(what), what.parent
         for s in shards:
             why = incomplete(s)
@@ -1941,17 +1978,18 @@ def model_step(a, models: Path, choice: tuple):
         shards = local_shards(m, d)
         if any(file_incomplete(m, s) for s in shards) and not offer_download(a, quant, d, shards):
             return None
-    if is_exl3(quant) and kind != "local":
-        conf = read_json(d / "config.json")
-        method = (conf.get("quantization_config") or {}).get("quant_method")
-        if conf.get("model_type") != "glm5_next" or method != "exl3":
-            fail(f"{d / 'config.json'}: a {conf.get('model_type')!r} model quantized as {method!r}, not GLM-5.3-Flash "
-                 "in EXL3 (glm5_next, exl3)")
-    else:
-        from gguf_reader import GGUFFile
-        arch = str(GGUFFile(shards[0]).metadata.get("general.architecture", ""))
-        if arch not in GLM_ARCHS:
-            fail(f"{shards[0].name} is a {arch!r} model, not GLM-5.3-Flash (glm5-next)")
+    if kind != "local-exl3":   # (an EXL3 folder checked its own config.json above)
+        if is_exl3(quant) and kind != "local":
+            conf = read_json(d / "config.json")
+            method = (conf.get("quantization_config") or {}).get("quant_method")
+            if conf.get("model_type") != "glm5_next" or method not in EXL3_METHODS:
+                fail(f"{d / 'config.json'}: a {conf.get('model_type')!r} model quantized as {method!r}, not "
+                     f"GLM-5.3-Flash in EXL3 (glm5_next, {' or '.join(EXL3_METHODS)})")
+        else:
+            from gguf_reader import GGUFFile
+            arch = str(GGUFFile(shards[0]).metadata.get("general.architecture", ""))
+            if arch not in GLM_ARCHS:
+                fail(f"{shards[0].name} is a {arch!r} model, not GLM-5.3-Flash (glm5-next)")
     gb = sum(s.stat().st_size for s in shards) / 1e9
     ok(f"{quant}: {len(shards)} file(s), {gb:.1f} GB in {d}")
     if rotational(d):
@@ -2023,7 +2061,7 @@ def stamp_pack(pack: Path, shards: list) -> None:
 
 def pack_step(a, d: Path, shards: list, llama: Path, quant: str | None = None) -> Path:
     step(6, "the pack (the engine's index of the model files)")
-    if quant is not None and is_exl3(quant):
+    if quant is not None and (is_exl3(quant) or exl3_dir(d)):
         return exl3_pack_step(a, d)
     # the engine finds the GGUF files at <pack>/.. (src/core/glm_model.cu, load_pack): the pack lives in their folder,
     # in pack/ - or pack-<model>/ when pack/ indexes another model of the same folder
@@ -2080,9 +2118,9 @@ def exl3_pack_step(a, d: Path) -> Path:
         return pack
     if not os.access(d, os.W_OK):
         fail(f"{d} is not writable: the pack and {EXL3_GGUF} are written next to the model's files")
-    say(f"  Writing {EXL3_GGUF} (the unquantized tensors and the tokenizer, about 2 GB), the index of every tensor,")
-    say("  the small float weights (about 1 GB) and the tokenizer; the EXL3 weights stay in the safetensors (a few")
-    say("  minutes) ...")
+    say(f"  Writing {EXL3_GGUF} (the unquantized tensors and the tokenizer), the index of every tensor, the float")
+    say("  weights and the tokenizer; the EXL3 weights stay in the safetensors. A selective checkpoint keeps")
+    say("  everything but its routed experts unquantized - tens of GB: this takes a while ...")
     run([sys.executable, str(ROOT / "tools" / "exl3_pack.py"), "--model", str(d), "--out", str(pack)])
     missing = [f for f in PACK_FILES + ("exl3.txt",) if not (pack / f).exists()] + \
         ([] if (d / EXL3_GGUF).exists() else [f"../{EXL3_GGUF}"])
@@ -3235,7 +3273,7 @@ def set_up(a, prev: dict) -> Path | None:
         ok(f"model: {choice[1]}, in {download_dir(models, choice[1])}")
     else:
         ok(f"model: {choice[1]} (yours)")
-    draft = choose_draft(a, pc, inst)
+    draft = choose_draft(a, pc, inst, choice)
     ok("drafting: " + ("a DFlash2 drafter (downloaded with the model)" if draft == "dflash2" else "the MTP block"))
     llama = tools_step(a)                              # 3
     meta = build_step(a, pc, llama)                    # 4
@@ -3791,6 +3829,11 @@ def maya_version() -> str:
 def main() -> int:
     N.alias_env(os.environ)   # (MAYA_* settings under the names the code and the engines read, for all it starts)
     stop_signals()            # (SIGTERM / SIGHUP stop it as Ctrl+C does: the server it runs with it)
+    try:                                       # the engine inherits this process's fd limit; a many-shard pack's
+        import serve.server as SV              # load wants more than a login shell's 1024 (raise_fd_limit)
+        SV.raise_fd_limit()
+    except Exception:                          # a broken serve/ import must not stop the installer
+        pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--backend", choices=["cuda", "hip"], help="GPU backend (HIP: experimental gfx1100/gfx1201/gfx1151 on Linux and Windows)")
     ap.add_argument("--setup", action="store_true", help="set up again instead of starting the installed model")
@@ -3818,10 +3861,11 @@ def main() -> int:
                          f"(downloads {DFLASH['bytes'] / 1e9:.1f} GB; NVIDIA)")
     ap.add_argument("--no-vision", action="store_true", help="text only: no image encoder (saves its build and "
                                                              "its 1.1 GB of files)")
-    ap.add_argument("--gguf-dir", help="use GLM-5.3-Flash GGUF files you already have: the folder with all of them, "
-                                       "or the .gguf file (the first one of a split model) when the folder holds "
-                                       "several models; it must be writable - the pack is written inside it "
-                                       "(without this option the setup lists the ones it finds in ~/models*)")
+    ap.add_argument("--gguf-dir", help="use a GLM-5.3-Flash model you already have: the folder with its GGUF files "
+                                       "or its EXL3 safetensors, or the .gguf file (the first one of a split model) "
+                                       "when the folder holds several models; it must be writable - the pack is "
+                                       "written inside it (without this option the setup lists the ones it finds in "
+                                       "~/models*)")
     ap.add_argument("--models-dir", help="where downloaded models go, each in a folder named after it, e.g. "
                                          "<DIR>/Maya-L/ (default: Maya-data/models next to this folder); use "
                                          "a fast NVMe SSD with ~100 GB free")
